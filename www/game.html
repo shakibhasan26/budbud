@@ -150,6 +150,12 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 .card .lv.now { background: var(--accent); color: var(--ink); border-color: var(--accent); }
 .card .lv:disabled { opacity: .3; cursor: not-allowed; }
 .hint { margin: 0; font-family: var(--mono); font-size: 11px; color: var(--muted); text-align: center; text-wrap: balance; }
+.bar { width: min(100%, 440px); display: flex; gap: 10px; }
+.bar button { flex: 1; font: 800 15px/1 var(--display); border-radius: 999px; padding: 13px 14px; cursor: pointer; }
+#again { flex: 0 0 auto; color: var(--text); background: transparent; border: 1px solid var(--line); }
+#boom { color: var(--ink); background: var(--accent); border: 2px solid var(--accent); }
+#boom.on { background: #ff7a1a; border-color: var(--text); box-shadow: 0 0 0 3px rgba(255,122,26,.35); }
+#boom:disabled { opacity: .35; cursor: not-allowed; }
 </style>
 
 <header class="hud">
@@ -182,12 +188,19 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     </div>
   </div>
 </main>
-<p class="hint">Drag to aim, release to shoot. Tap the small bubble to swap. Match 3 or more.</p>
+<div class="bar">
+  <button id="again" type="button" aria-label="Restart this level">Restart</button>
+  <button id="boom" type="button" aria-pressed="false">Burst Boom x1</button>
+</div>
+<p class="hint">Drag to aim, release to shoot. Tap the small bubbles to swap. Match 3 or more. Hit the golden star bubble to burst 10! Burst Boom blasts a whole area.</p>
 
 <script>
 (() => {
   const W = 400, H = 640, COLS = 10, R = 20, RH = R * Math.sqrt(3);
   const DANGER = 548, SX = W / 2, SY = 596, NX = SX - 100, NY = SY + 4;
+  const NX2 = NX - 36;            // second small bubble in the 3-colour queue
+  const BOOM = 9, BR = 76;        // Burst Boom: special bubble id, blast radius in px (about 10-12 bubbles)
+  const SPECIAL = 8, SPECIAL_POP = 10;  // star bubble sitting inside the board: hitting it bursts 10 bubbles
   const SPEED = 900, MAXLV = 30;
   const BG = '#161a2c', PANEL = '#1d2238', DANGERC = '#ff5a5f';
   // light, base, dark per colour
@@ -207,7 +220,8 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 
   let grid = [], flip = 0, level = 1, score = 0, misses = 0, nCols = 4, dropAt = 5;
   let prog = { cleared: 0, best: {} };
-  let cur = 0, nxt = 0, b = null, fx = [], bumps = [], state = 'aim', aim = Math.PI / 2, down = false;
+  let cur = 0, nxt = 0, nxt2 = null, b = null, fx = [], bumps = [], state = 'aim', aim = Math.PI / 2, down = false;
+  let boomLeft = 0, armed = false, shake = 0;
 
   // Progress (highest cleared level and best score per level) is kept on this phone.
   try {
@@ -245,6 +259,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     fall() { tone(640, .35, 'sine', .1, 160, .1); },
     drop() { tone(130, .28, 'sawtooth', .1, 70); },
     swap() { tone(660, .06, 'square', .05); },
+    boom() { tone(140, .5, 'sawtooth', .22, 40); tone(320, .25, 'square', .08, 70, .02); tone(900, .2, 'triangle', .1, 220, .05); },
     win() { [523, 659, 784, 1047].forEach((f, i) => tone(f, .22, 'triangle', .18, null, i * .12)); },
     over() { [392, 330, 262, 196].forEach((f, i) => tone(f, .3, 'sawtooth', .1, null, i * .16)); }
   };
@@ -265,7 +280,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 
   function presentColors() {
     const s = new Set();
-    for (const row of grid) for (const v of row) if (v != null) s.add(v);
+    for (const row of grid) for (const v of row) if (v != null && v !== SPECIAL) s.add(v);
     return [...s];
   }
   function pick() {
@@ -274,25 +289,87 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     return pool[Math.random() * pool.length | 0];
   }
 
-  // Difficulty by level: more colours, more starting rows, and the ceiling drops after fewer misses.
+  // Kid-friendly difficulty. It grows gently up to level 10, then stays the same forever
+  // (5 colours, at most 8 rows, ceiling drops after 5 misses). No sudden jump at level 14.
+  //   blob  = target size of each same-colour group (levels 1-10 get big groups, so one shot pops 5-6+)
+  //   booms = Burst Boom uses per level (1 for levels 1-3, then 3)
   function cfg(n) {
     return {
-      colors: n <= 2 ? 3 : n <= 5 ? 4 : n <= 10 ? 5 : 6,
-      rows: Math.min(4 + Math.floor(n / 3), 10),
-      drop: n <= 3 ? 6 : n <= 8 ? 5 : n <= 14 ? 4 : n <= 24 ? 3 : 2
+      colors: n <= 3 ? 3 : n <= 10 ? 4 : 5,
+      rows: Math.min(4 + Math.floor(n / 4), 8),
+      drop: n <= 10 ? 6 : 5,
+      blob: n <= 10 ? [5, 7] : [3, 4],
+      booms: n <= 3 ? 1 : 3
     };
   }
+
+  // Build the starting board out of same-colour groups instead of random single bubbles.
+  function blobGrid(rows, colors, size) {
+    grid = [];
+    for (let r = 0; r < rows; r++) grid.push(emptyRow(rowLen(r)));
+    const cells = [];
+    for (let r = 0; r < rows; r++) for (let c = 0; c < rowLen(r); c++) cells.push([r, c]);
+    for (let i = cells.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [cells[i], cells[j]] = [cells[j], cells[i]]; }
+    const all = [...Array(colors).keys()];
+    for (const [r, c] of cells) {
+      if (grid[r][c] != null) continue;
+      // start a new group with a colour that is not already touching this spot
+      const touching = new Set(nbrs(r, c).map(([a, e]) => grid[a][e]).filter(v => v != null));
+      const free = all.filter(k => !touching.has(k));
+      const pool = free.length ? free : all;
+      const col = pool[Math.random() * pool.length | 0];
+      const want = size[0] + (Math.random() * (size[1] - size[0] + 1) | 0);
+      grid[r][c] = col;
+      const edge = [[r, c]];
+      let n = 1;
+      while (n < want && edge.length) {
+        const i = Math.random() * edge.length | 0;
+        const open = nbrs(edge[i][0], edge[i][1]).filter(([a, e]) => grid[a][e] == null);
+        if (!open.length) { edge.splice(i, 1); continue; }
+        const [a, e] = open[Math.random() * open.length | 0];
+        grid[a][e] = col; edge.push([a, e]); n++;
+      }
+    }
+  }
+
+  // The shooter has 3 bubbles in a row: shoot one, the other two wait. Always 3 different colours
+  // (when the board has that many), and always colours that are still on the board.
+  function fixQueue() {
+    const present = presentColors();
+    if (!present.length) return;
+    const s = [cur, nxt, nxt2], used = [];
+    for (let i = 0; i < 3; i++) {
+      let v = s[i];
+      const dup = used.includes(v) && present.length > used.length;
+      if (v == null || !present.includes(v) || dup) {
+        const fresh = present.filter(x => !used.includes(x));
+        const pool = fresh.length ? fresh : present;
+        v = pool[Math.random() * pool.length | 0];
+      }
+      s[i] = v; used.push(v);
+    }
+    [cur, nxt, nxt2] = s;
+  }
+
+  function boomUI() {
+    const bt = $('boom');
+    bt.textContent = armed ? 'Boom ready! Shoot' : 'Burst Boom x' + boomLeft;
+    bt.disabled = state !== 'aim' || (boomLeft <= 0 && !armed);
+    bt.classList.toggle('on', armed);
+    bt.setAttribute('aria-pressed', String(armed));
+  }
+
   function startLevel(n) {
     level = n; score = 0;
     const c = cfg(n);
     nCols = c.colors; dropAt = c.drop;
-    const rows = c.rows;
-    flip = 0; grid = [];
-    for (let r = 0; r < rows; r++) {
-      grid.push(Array.from({ length: rowLen(r) }, () => Math.random() * nCols | 0));
-    }
-    misses = 0; fx = []; bumps = []; b = null;
-    cur = pick(); nxt = pick();
+    flip = 0;
+    blobGrid(c.rows, c.colors, c.blob);
+    const sr = Math.floor((c.rows - 1) / 2);
+    grid[sr][Math.floor(rowLen(sr) / 2)] = SPECIAL;
+    misses = 0; fx = []; bumps = []; b = null; shake = 0;
+    boomLeft = c.booms; armed = false;
+    cur = nxt = nxt2 = null; fixQueue();
     state = 'aim';
     overlay.hidden = true;
     picker.hidden = true;
@@ -318,7 +395,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     }
   }
   function openPicker() {
-    state = 'menu';
+    state = 'menu'; armed = false; boomUI();
     overlay.hidden = true;
     renderGrid();
     picker.hidden = false;
@@ -331,6 +408,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     const left = dropAt - misses;
     $('pips').innerHTML = Array.from({ length: dropAt },(_, i) => '<span class="pip' + (i < left ? ' on' : '') + '"></span>').join('');
     $('drop').classList.toggle('warn', left === 1);
+    boomUI();
   }
 
   function addRow() {
@@ -395,7 +473,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   }
 
   const trim = () => { while (grid.length && grid[grid.length - 1].every(v => v == null)) grid.pop(); };
-  const isEmpty = () => grid.every(row => row.every(v => v == null));
+  const isEmpty = () => grid.every(row => row.every(v => v == null || v === SPECIAL));
   function overLimit() {
     for (let r = 0; r < grid.length; r++) {
       if (R + r * RH + R > DANGER && grid[r].some(v => v != null)) return true;
@@ -403,35 +481,108 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     return false;
   }
 
+  // Bubbles that are no longer connected to the ceiling fall down.
+  function dropLoose() {
+    let fallen = 0;
+    const att = attached();
+    for (let rr = 0; rr < grid.length; rr++) {
+      for (let cc = 0; cc < grid[rr].length; cc++) {
+        const v = grid[rr][cc];
+        if (v != null && !att.has(rr + ',' + cc)) {
+          const [x, y] = cellPos(rr, cc);
+          fx.push({ k: 'fall', x, y, vx: (Math.random() - .5) * 140, vy: -90 - Math.random() * 120, col: v });
+          grid[rr][cc] = null; score += 20; if (!fallen++) sfx.fall();
+        }
+      }
+    }
+  }
+
+  // Burst Boom: everything inside the blast radius pops.
+  function burst(r, c) {
+    const [x0, y0] = cellPos(r, c);
+    let n = 0;
+    for (let rr = 0; rr < grid.length; rr++) {
+      for (let cc = 0; cc < grid[rr].length; cc++) {
+        const v = grid[rr][cc];
+        if (v == null) continue;
+        const [x, y] = cellPos(rr, cc);
+        if ((x - x0) ** 2 + (y - y0) ** 2 <= BR * BR) {
+          fx.push({ k: 'pop', x, y, col: v, t: 0 });
+          grid[rr][cc] = null; n++;
+        }
+      }
+    }
+    fx.push({ k: 'boom', x: x0, y: y0, t: 0, s: 1 });
+    shake = .3; sfx.boom();
+    score += n * 10;
+    dropLoose();
+  }
+
+  // Star bubble: when a shot touches it, it and the 9 bubbles nearest to it pop (10 in total).
+  function burstSpecial(sr, sc) {
+    const [x0, y0] = cellPos(sr, sc);
+    const near = [];
+    for (let rr = 0; rr < grid.length; rr++) {
+      for (let cc = 0; cc < grid[rr].length; cc++) {
+        const v = grid[rr][cc];
+        if (v == null || v === SPECIAL) continue;
+        const [x, y] = cellPos(rr, cc);
+        near.push({ rr, cc, x, y, v, d: Math.hypot(x - x0, y - y0) + Math.random() * 2 });
+      }
+    }
+    near.sort((p, q) => p.d - q.d);
+    fx.push({ k: 'pop', x: x0, y: y0, col: SPECIAL, t: 0 });
+    grid[sr][sc] = null;
+    const take = near.slice(0, SPECIAL_POP - 1);
+    for (const t of take) { fx.push({ k: 'pop', x: t.x, y: t.y, col: t.v, t: 0 }); grid[t.rr][t.cc] = null; }
+    fx.push({ k: 'boom', x: x0, y: y0, t: 0, s: .75 });
+    shake = .2; sfx.boom();
+    score += (take.length + 1) * 10 + 50;
+    dropLoose();
+  }
+
+  function clearSpecials() {
+    for (let rr = 0; rr < grid.length; rr++) {
+      for (let cc = 0; cc < grid[rr].length; cc++) {
+        if (grid[rr][cc] !== SPECIAL) continue;
+        const [x, y] = cellPos(rr, cc);
+        fx.push({ k: 'pop', x, y, col: SPECIAL, t: 0 });
+        grid[rr][cc] = null;
+      }
+    }
+  }
+
   function land() {
     const [r, c] = snap();
     const col = b.col;
     let rowAdded = false;
-    grid[r][c] = col; b = null;
-    const cl = cluster(r, c);
-    if (cl.length >= 3) {
-      for (const [rr, cc] of cl) {
-        const [x, y] = cellPos(rr, cc);
-        fx.push({ k: 'pop', x, y, col, t: 0 });
-        grid[rr][cc] = null;
+    b = null;
+    if (col === BOOM) {
+      burst(r, c);                       // a boom shot never counts as a miss
+    } else {
+      grid[r][c] = col;
+      let popped = false;
+      for (const [a, e] of nbrs(r, c)) {  // touching the star bubble sets it off
+        if (grid[a][e] === SPECIAL) { burstSpecial(a, e); popped = true; }
       }
-      score += cl.length * 10 + (cl.length - 3) * 10;
-      sfx.pop(cl.length);
-      let fallen = 0;
-      const att = attached();
-      for (let rr = 0; rr < grid.length; rr++) {
-        for (let cc = 0; cc < grid[rr].length; cc++) {
-          const v = grid[rr][cc];
-          if (v != null && !att.has(rr + ',' + cc)) {
+      if (grid[r][c] != null) {
+        const cl = cluster(r, c);
+        if (cl.length >= 3) {
+          for (const [rr, cc] of cl) {
             const [x, y] = cellPos(rr, cc);
-            fx.push({ k: 'fall', x, y, vx: (Math.random() - .5) * 140, vy: -90 - Math.random() * 120, col: v });
-            grid[rr][cc] = null; score += 20; if (!fallen++) sfx.fall();
+            fx.push({ k: 'pop', x, y, col, t: 0 });
+            grid[rr][cc] = null;
           }
+          score += cl.length * 10 + (cl.length - 3) * 10;
+          sfx.pop(cl.length);
+          dropLoose();
+          popped = true;
         }
       }
-    } else {
-      misses++; sfx.stick();
-      if (misses >= dropAt) { misses = 0; addRow(); sfx.drop(); rowAdded = true; }
+      if (!popped) {
+        misses++; sfx.stick();
+        if (misses >= dropAt) { misses = 0; addRow(); sfx.drop(); rowAdded = true; }
+      }
     }
     trim();
     // the 5-6 bubbles touching the impact spot hop a little, away from it
@@ -446,9 +597,9 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
       }
     }
     if (score > (prog.best[level] || 0)) { prog.best[level] = score; saveProg(); }
-    if (isEmpty()) { state = 'win'; if (level > prog.cleared) prog.cleared = level; saveProg(); show('win'); sfx.win(); }
+    if (isEmpty()) { clearSpecials(); trim(); state = 'win'; if (level > prog.cleared) prog.cleared = level; saveProg(); show('win'); sfx.win(); }
     else if (overLimit()) { state = 'over'; show('over'); sfx.over(); }
-    else { nxt = pick(); state = 'aim'; }
+    else { fixQueue(); state = 'aim'; }
     hud();
   }
 
@@ -466,8 +617,11 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   function fire() {
     if (state !== 'aim') return;
     state = 'fly'; sfx.shoot();
-    b = { x: SX, y: SY, vx: Math.cos(aim) * SPEED, vy: -Math.sin(aim) * SPEED, col: cur };
-    cur = nxt; nxt = null;
+    let col;
+    if (armed && boomLeft > 0) { col = BOOM; boomLeft--; armed = false; }   // Burst Boom shot, queue stays as it is
+    else { col = cur; cur = nxt; nxt = nxt2; nxt2 = null; }                  // normal shot, queue moves up
+    b = { x: SX, y: SY, vx: Math.cos(aim) * SPEED, vy: -Math.sin(aim) * SPEED, col };
+    boomUI();
   }
 
   function stepFlight(dt) {
@@ -484,9 +638,11 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     bumps = bumps.filter(m => m.t < 1);
     for (const f of fx) {
       if (f.k === 'pop') f.t += dt / 0.25;
+      else if (f.k === 'boom') f.t += dt / 0.45;
       else { f.vy += 1400 * dt; f.x += f.vx * dt; f.y += f.vy * dt; }
     }
-    fx = fx.filter(f => f.k === 'pop' ? f.t < 1 : f.y < H + 40);
+    if (shake > 0) shake = Math.max(0, shake - dt);
+    fx = fx.filter(f => (f.k === 'pop' || f.k === 'boom') ? f.t < 1 : f.y < H + 40);
   }
 
   function glyph(x, y, i) {
@@ -504,8 +660,44 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     ctx.restore();
   }
 
+  // Burst Boom ball (fiery, dark spiky star) and the star bubble sitting in the board (gold, white star)
+  function starPath(spikes, outer, inner) {
+    ctx.beginPath();
+    for (let n = 0; n < spikes * 2; n++) {
+      const rad = n % 2 ? inner : outer, ang = n * Math.PI / spikes - Math.PI / 2;
+      ctx.lineTo(Math.cos(ang) * rad, Math.sin(ang) * rad);
+    }
+    ctx.closePath();
+  }
+  function specialBall(x, y, i, r, a) {
+    const t = performance.now() / 1000, boom = i === BOOM;
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.translate(x, y);
+    const k = r / R * (1 + .05 * Math.sin(t * (boom ? 9 : 4)));
+    ctx.scale(k, k);
+    ctx.shadowColor = boom ? 'rgba(255,140,30,.95)' : 'rgba(255,240,150,.95)';
+    ctx.shadowBlur = boom ? 14 : 16;
+    const g = ctx.createRadialGradient(-6, -8, 2, 0, 0, R);
+    if (boom) { g.addColorStop(0, '#fff3b0'); g.addColorStop(.5, '#ff9f1c'); g.addColorStop(1, '#d1380f'); }
+    else { g.addColorStop(0, '#ffffff'); g.addColorStop(.5, '#ffe066'); g.addColorStop(1, '#e08a00'); }
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, R - 1, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+    if (boom) { ctx.fillStyle = '#10131f'; starPath(8, 11, 5); ctx.fill(); }
+    else {
+      ctx.strokeStyle = 'rgba(255,255,255,' + (.55 + .35 * Math.sin(t * 4)) + ')'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, R - 3, 0, 7); ctx.stroke();
+      ctx.fillStyle = '#ff4d5a'; starPath(5, 11, 4.6); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,.55)';
+      ctx.beginPath(); ctx.ellipse(-6, -8, 4, 2.4, -.6, 0, 7); ctx.fill();
+    }
+    ctx.restore();
+  }
+
   function bubble(x, y, i, r, a) {
     r = r || R; a = a == null ? 1 : a;
+    if (i === BOOM || i === SPECIAL) { specialBall(x, y, i, r, a); return; }
     const p = PAL[i];
     ctx.save();
     ctx.globalAlpha = a;
@@ -555,6 +747,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   function draw(now) {
     ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
     ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+    if (shake > 0) { const m = 5 * shake / .3; ctx.translate((Math.random() - .5) * 2 * m, (Math.random() - .5) * 2 * m); }
     ctx.fillStyle = PANEL; ctx.fillRect(0, DANGER, W, H - DANGER);
     ctx.strokeStyle = DANGERC; ctx.globalAlpha = .7; ctx.lineWidth = 2;
     ctx.setLineDash([8, 8]);
@@ -585,14 +778,30 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
       ctx.beginPath(); ctx.arc(tgt.land[0], tgt.land[1], R - 1, 0, 7);
       ctx.fillStyle = 'rgba(255,255,255,.22)'; ctx.fill();
       ctx.stroke();
+      if (armed) {   // show how far the Burst Boom will reach
+        ctx.strokeStyle = '#ff9f1c'; ctx.lineWidth = 2; ctx.globalAlpha = .9;
+        ctx.setLineDash([6, 6]);
+        ctx.beginPath(); ctx.arc(tgt.land[0], tgt.land[1], BR, 0, 7); ctx.stroke();
+      }
       ctx.restore();
     }
     for (const f of fx) {
       if (f.k === 'pop') {
         bubble(f.x, f.y, f.col, R * (1 + f.t * .35), 1 - f.t);
         ctx.save();
-        ctx.strokeStyle = PAL[f.col][0]; ctx.globalAlpha = (1 - f.t) * .8; ctx.lineWidth = 3;
+        ctx.strokeStyle = PAL[f.col] ? PAL[f.col][0] : '#fff3b0'; ctx.globalAlpha = (1 - f.t) * .8; ctx.lineWidth = 3;
         ctx.beginPath(); ctx.arc(f.x, f.y, R * (1 + f.t * 1.2), 0, 7); ctx.stroke();
+        ctx.restore();
+      } else if (f.k === 'boom') {
+        const e = 1 - (1 - f.t) ** 2, rad = BR * f.s * (.4 + .8 * e), fade = 1 - f.t;
+        ctx.save();
+        const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, rad);
+        g.addColorStop(0, 'rgba(255,243,176,' + .9 * fade + ')');
+        g.addColorStop(.6, 'rgba(255,159,28,' + .5 * fade + ')');
+        g.addColorStop(1, 'rgba(255,90,40,0)');
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(f.x, f.y, rad, 0, 7); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,' + fade + ')'; ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.arc(f.x, f.y, rad * .9, 0, 7); ctx.stroke();
         ctx.restore();
       } else bubble(f.x, f.y, f.col);
     }
@@ -603,11 +812,12 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     ctx.strokeStyle = '#2b3250'; ctx.lineWidth = 12; ctx.lineCap = 'round';
     ctx.beginPath(); ctx.moveTo(SX, SY); ctx.lineTo(SX + Math.cos(aim) * 34, SY - Math.sin(aim) * 34); ctx.stroke();
     ctx.restore();
-    if (cur != null) bubble(SX, SY, cur);
+    if (cur != null) bubble(SX, SY, armed ? BOOM : cur);
+    if (nxt2 != null) bubble(NX2, NY + 2, nxt2, 11);
     if (nxt != null) {
       bubble(NX, NY, nxt, 14);
       ctx.fillStyle = '#8d96bd'; ctx.font = '500 10px "DM Mono", monospace'; ctx.textAlign = 'center';
-      ctx.fillText('SWAP', NX, NY + 30);
+      ctx.fillText('SWAP', (NX + NX2) / 2, NY + 30);
     }
     if (b) bubble(b.x, b.y, b.col);
   }
@@ -635,7 +845,11 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     audio();
     if (state !== 'aim') return;
     const [x, y] = toLogical(e);
-    if (nxt != null && Math.hypot(x - NX, y - NY) < 28) { const t = cur; cur = nxt; nxt = t; sfx.swap(); return; }
+    if ((nxt != null && Math.hypot(x - NX, y - NY) < 28) || (nxt2 != null && Math.hypot(x - NX2, y - NY) < 24)) {
+      if (nxt2 == null) { const t = cur; cur = nxt; nxt = t; }
+      else { const t = cur; cur = nxt; nxt = nxt2; nxt2 = t; }   // 3 colours take turns
+      sfx.swap(); return;
+    }
     down = true; setAim(x, y);
     try { cv.setPointerCapture(e.pointerId); } catch (err) {}
   });
@@ -657,6 +871,13 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   });
 
   $('restart').addEventListener('click', openPicker);
+  $('again').addEventListener('click', () => { audio(); startLevel(level); });   // restart this level
+  $('boom').addEventListener('click', () => {
+    if (state !== 'aim') return;
+    audio();
+    if (armed) armed = false; else if (boomLeft > 0) armed = true; else return;
+    sfx.swap(); boomUI();
+  });
   function paintMute() {
     const m = $('mute');
     m.textContent = 'Sound: ' + (muted ? 'off' : 'on');
@@ -678,7 +899,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   new ResizeObserver(fit).observe(stage);
   window.addEventListener('resize', fit);
   fit();
-  cur = null; nxt = null;
+  cur = null; nxt = null; nxt2 = null;
   hud();
   openPicker();
 
