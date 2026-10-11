@@ -79,6 +79,16 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 .pip { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
 .pip.on { background: var(--accent); }
 .warn .pip.on { background: var(--danger); }
+#mute {
+  margin-left: auto;
+  font: 500 11px/1 var(--mono);
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 7px 11px;
+  cursor: pointer;
+}
 #stage {
   flex: 1;
   min-height: 0;
@@ -129,7 +139,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   <div class="stat"><span class="lbl">Best</span><b id="best">0</b></div>
   <div class="stat"><span class="lbl">Level</span><b id="level">1</b></div>
   <button id="restart" type="button">New game</button>
-  <div class="drop" id="drop"><span class="lbl">Ceiling drops in</span><div id="pips"></div></div>
+  <div class="drop" id="drop"><span class="lbl">Ceiling drops in</span><div id="pips"></div><button id="mute" type="button" aria-pressed="true">Sound: on</button></div>
 </header>
 <main id="stage">
   <div id="frame">
@@ -171,6 +181,39 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 
   try { best = +localStorage.getItem('budbud-best') || 0; } catch (e) {}
   function saveBest() { try { localStorage.setItem('budbud-best', String(best)); } catch (e) {} }
+
+  // Sound: tiny synthesized effects, no audio files. Starts after the first tap (browser rule).
+  let actx = null, muted = false;
+  try { muted = localStorage.getItem('budbud-muted') === '1'; } catch (e) {}
+  function audio() {
+    if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return null; } }
+    if (actx.state === 'suspended') actx.resume();
+    return actx;
+  }
+  function tone(freq, dur, type, vol, slideTo, delay) {
+    if (muted) return;
+    const a = audio(); if (!a) return;
+    const t = a.currentTime + (delay || 0);
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol || .15, t + .01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(t); o.stop(t + dur + .02);
+  }
+  const sfx = {
+    shoot() { tone(420, .12, 'triangle', .18, 780); },
+    stick() { tone(180, .09, 'sine', .22, 110); },
+    pop(n) { for (let i = 0; i < Math.min(n, 6); i++) tone(520 + i * 90, .13, 'sine', .16, 900 + i * 90, i * .045); },
+    fall() { tone(640, .35, 'sine', .1, 160, .1); },
+    drop() { tone(130, .28, 'sawtooth', .1, 70); },
+    swap() { tone(660, .06, 'square', .05); },
+    win() { [523, 659, 784, 1047].forEach((f, i) => tone(f, .22, 'triangle', .18, null, i * .12)); },
+    over() { [392, 330, 262, 196].forEach((f, i) => tone(f, .3, 'sawtooth', .1, null, i * .16)); }
+  };
 
   const isShort = r => ((r + flip) & 1) === 1;
   const rowLen = r => isShort(r) ? COLS - 1 : COLS;
@@ -302,6 +345,8 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
         grid[rr][cc] = null;
       }
       score += cl.length * 10 + (cl.length - 3) * 10;
+      sfx.pop(cl.length);
+      let fallen = 0;
       const att = attached();
       for (let rr = 0; rr < grid.length; rr++) {
         for (let cc = 0; cc < grid[rr].length; cc++) {
@@ -309,18 +354,18 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
           if (v != null && !att.has(rr + ',' + cc)) {
             const [x, y] = cellPos(rr, cc);
             fx.push({ k: 'fall', x, y, vx: (Math.random() - .5) * 140, vy: -90 - Math.random() * 120, col: v });
-            grid[rr][cc] = null; score += 20;
+            grid[rr][cc] = null; score += 20; if (!fallen++) sfx.fall();
           }
         }
       }
     } else {
-      misses++;
-      if (misses >= DROP) { misses = 0; addRow(); }
+      misses++; sfx.stick();
+      if (misses >= DROP) { misses = 0; addRow(); sfx.drop(); }
     }
     trim();
     if (score > best) { best = score; saveBest(); }
-    if (isEmpty()) { state = 'win'; show('win'); }
-    else if (overLimit()) { state = 'over'; show('over'); }
+    if (isEmpty()) { state = 'win'; show('win'); sfx.win(); }
+    else if (overLimit()) { state = 'over'; show('over'); sfx.over(); }
     else { nxt = pick(); state = 'aim'; }
     hud();
   }
@@ -336,7 +381,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 
   function fire() {
     if (state !== 'aim') return;
-    state = 'fly';
+    state = 'fly'; sfx.shoot();
     b = { x: SX, y: SY, vx: Math.cos(aim) * SPEED, vy: -Math.sin(aim) * SPEED, col: cur };
     cur = nxt; nxt = null;
   }
@@ -468,9 +513,10 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   };
 
   cv.addEventListener('pointerdown', e => {
+    audio();
     if (state !== 'aim') return;
     const [x, y] = toLogical(e);
-    if (nxt != null && Math.hypot(x - NX, y - NY) < 28) { const t = cur; cur = nxt; nxt = t; return; }
+    if (nxt != null && Math.hypot(x - NX, y - NY) < 28) { const t = cur; cur = nxt; nxt = t; sfx.swap(); return; }
     down = true; setAim(x, y);
     try { cv.setPointerCapture(e.pointerId); } catch (err) {}
   });
@@ -492,6 +538,18 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   });
 
   $('restart').addEventListener('click', newGame);
+  function paintMute() {
+    const m = $('mute');
+    m.textContent = 'Sound: ' + (muted ? 'off' : 'on');
+    m.setAttribute('aria-pressed', String(!muted));
+  }
+  $('mute').addEventListener('click', () => {
+    muted = !muted;
+    try { localStorage.setItem('budbud-muted', muted ? '1' : '0'); } catch (e) {}
+    paintMute();
+    if (!muted) { audio(); sfx.swap(); }
+  });
+  paintMute();
   $('ovBtn').addEventListener('click', () => {
     if ($('ovBtn').dataset.kind === 'win') { level++; startLevel(); } else newGame();
   });
