@@ -2,5 +2,8 @@
   "appId": "com.budbud.game",
   "appName": "Budbud",
   "webDir": "www",
-  "backgroundColor": "#10131f"
+  "backgroundColor": "#10131f",
+  "server": {
+    "allowNavigation": ["shakibhasan26.github.io"]
+  }
 }
