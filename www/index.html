@@ -99,7 +99,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 }
 #frame { position: relative; border-radius: 14px; overflow: hidden; background: var(--panel); }
 #c { display: block; width: 100%; height: 100%; touch-action: none; }
-#overlay {
+#overlay, #picker {
   position: absolute;
   inset: 0;
   display: flex;
@@ -131,6 +131,24 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   padding: 12px 24px;
   cursor: pointer;
 }
+.row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+.card .ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+.pick { width: 100%; max-height: 100%; overflow-y: auto; padding: 18px 14px; }
+#grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; width: 100%; }
+.card .lv {
+  aspect-ratio: 1;
+  min-width: 0;
+  padding: 0;
+  border-radius: 12px;
+  font: 800 17px/1 var(--display);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: var(--ink);
+  border: 1px solid var(--line);
+}
+.card .lv.done { border-color: var(--accent); }
+.card .lv.now { background: var(--accent); color: var(--ink); border-color: var(--accent); }
+.card .lv:disabled { opacity: .3; cursor: not-allowed; }
 .hint { margin: 0; font-family: var(--mono); font-size: 11px; color: var(--muted); text-align: center; text-wrap: balance; }
 </style>
 
@@ -138,7 +156,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   <div class="stat"><span class="lbl">Score</span><b id="score">0</b></div>
   <div class="stat"><span class="lbl">Best</span><b id="best">0</b></div>
   <div class="stat"><span class="lbl">Level</span><b id="level">1</b></div>
-  <button id="restart" type="button">New game</button>
+  <button id="restart" type="button">Levels</button>
   <div class="drop" id="drop"><span class="lbl">Ceiling drops in</span><div id="pips"></div><button id="mute" type="button" aria-pressed="true">Sound: on</button></div>
 </header>
 <main id="stage">
@@ -148,7 +166,18 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
       <div class="card">
         <h1 id="ovTitle">Game over</h1>
         <p id="ovText"></p>
-        <button id="ovBtn" type="button">Play again</button>
+        <div class="row">
+          <button id="ovBtn" type="button">Retry</button>
+          <button id="ovBtn2" class="ghost" type="button">Levels</button>
+        </div>
+      </div>
+    </div>
+    <div id="picker" hidden>
+      <div class="card pick">
+        <h1>Choose a level</h1>
+        <p id="pickInfo"></p>
+        <button id="cont" type="button">Play</button>
+        <div id="grid"></div>
       </div>
     </div>
   </div>
@@ -159,7 +188,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 (() => {
   const W = 400, H = 640, COLS = 10, R = 20, RH = R * Math.sqrt(3);
   const DANGER = 548, SX = W / 2, SY = 596, NX = SX - 100, NY = SY + 4;
-  const SPEED = 900, DROP = 5;
+  const SPEED = 900, MAXLV = 30;
   const BG = '#161a2c', PANEL = '#1d2238', DANGERC = '#ff5a5f';
   // light, base, dark per colour
   const PAL = [
@@ -173,14 +202,19 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 
   const cv = document.getElementById('c'), ctx = cv.getContext('2d');
   const frame = document.getElementById('frame'), stage = document.getElementById('stage');
-  const overlay = document.getElementById('overlay');
+  const overlay = document.getElementById('overlay'), picker = document.getElementById('picker');
   const $ = id => document.getElementById(id);
 
-  let grid = [], flip = 0, level = 1, score = 0, best = 0, misses = 0, nCols = 4;
+  let grid = [], flip = 0, level = 1, score = 0, misses = 0, nCols = 4, dropAt = 5;
+  let prog = { cleared: 0, best: {} };
   let cur = 0, nxt = 0, b = null, fx = [], state = 'aim', aim = Math.PI / 2, down = false;
 
-  try { best = +localStorage.getItem('budbud-best') || 0; } catch (e) {}
-  function saveBest() { try { localStorage.setItem('budbud-best', String(best)); } catch (e) {} }
+  // Progress (highest cleared level and best score per level) is kept on this phone.
+  try {
+    const p = JSON.parse(localStorage.getItem('budbud-progress') || 'null');
+    if (p && typeof p === 'object') prog = { cleared: Math.max(0, +p.cleared || 0), best: p.best || {} };
+  } catch (e) {}
+  function saveProg() { try { localStorage.setItem('budbud-progress', JSON.stringify(prog)); } catch (e) {} }
 
   // Sound: tiny synthesized effects, no audio files. Starts after the first tap (browser rule).
   let actx = null, muted = false;
@@ -240,9 +274,19 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     return pool[Math.random() * pool.length | 0];
   }
 
-  function startLevel() {
-    nCols = Math.min(3 + level, 6);
-    const rows = Math.min(4 + level, 8);
+  // Difficulty by level: more colours, more starting rows, and the ceiling drops after fewer misses.
+  function cfg(n) {
+    return {
+      colors: n <= 2 ? 3 : n <= 5 ? 4 : n <= 10 ? 5 : 6,
+      rows: Math.min(4 + Math.floor(n / 3), 10),
+      drop: n <= 3 ? 6 : n <= 8 ? 5 : n <= 14 ? 4 : n <= 24 ? 3 : 2
+    };
+  }
+  function startLevel(n) {
+    level = n; score = 0;
+    const c = cfg(n);
+    nCols = c.colors; dropAt = c.drop;
+    const rows = c.rows;
     flip = 0; grid = [];
     for (let r = 0; r < rows; r++) {
       grid.push(Array.from({ length: rowLen(r) }, () => Math.random() * nCols | 0));
@@ -251,16 +295,41 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     cur = pick(); nxt = pick();
     state = 'aim';
     overlay.hidden = true;
+    picker.hidden = true;
     hud();
   }
-  function newGame() { level = 1; score = 0; startLevel(); }
+
+  function renderGrid() {
+    const g = $('grid');
+    g.innerHTML = '';
+    const open = prog.cleared + 1;
+    const total = Math.max(MAXLV, Math.ceil((prog.cleared + 6) / 5) * 5);
+    $('pickInfo').textContent = 'Cleared ' + prog.cleared + (prog.cleared === 1 ? ' level' : ' levels') + '. The levels never end.';
+    $('cont').textContent = 'Play level ' + open;
+    for (let n = 1; n <= total; n++) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = n;
+      btn.className = 'lv' + (n <= prog.cleared ? ' done' : '') + (n === prog.cleared + 1 ? ' now' : '');
+      if (n > open) { btn.disabled = true; btn.setAttribute('aria-label', 'Level ' + n + ', locked'); }
+      else btn.setAttribute('aria-label', 'Level ' + n + (n <= prog.cleared ? ', cleared' : ''));
+      btn.addEventListener('click', () => startLevel(n));
+      g.appendChild(btn);
+    }
+  }
+  function openPicker() {
+    state = 'menu';
+    overlay.hidden = true;
+    renderGrid();
+    picker.hidden = false;
+  }
 
   function hud() {
     $('score').textContent = score;
-    $('best').textContent = best;
+    $('best').textContent = prog.best[level] || 0;
     $('level').textContent = level;
-    const left = DROP - misses;
-    $('pips').innerHTML = Array.from({ length: DROP }, (_, i) => '<span class="pip' + (i < left ? ' on' : '') + '"></span>').join('');
+    const left = dropAt - misses;
+    $('pips').innerHTML = Array.from({ length: dropAt },(_, i) => '<span class="pip' + (i < left ? ' on' : '') + '"></span>').join('');
     $('drop').classList.toggle('warn', left === 1);
   }
 
@@ -360,11 +429,11 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
       }
     } else {
       misses++; sfx.stick();
-      if (misses >= DROP) { misses = 0; addRow(); sfx.drop(); }
+      if (misses >= dropAt) { misses = 0; addRow(); sfx.drop(); }
     }
     trim();
-    if (score > best) { best = score; saveBest(); }
-    if (isEmpty()) { state = 'win'; show('win'); sfx.win(); }
+    if (score > (prog.best[level] || 0)) { prog.best[level] = score; saveProg(); }
+    if (isEmpty()) { state = 'win'; if (level > prog.cleared) prog.cleared = level; saveProg(); show('win'); sfx.win(); }
     else if (overLimit()) { state = 'over'; show('over'); sfx.over(); }
     else { nxt = pick(); state = 'aim'; }
     hud();
@@ -372,11 +441,13 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 
   function show(kind) {
     $('ovTitle').textContent = kind === 'win' ? 'Level ' + level + ' cleared' : 'Game over';
-    $('ovText').textContent = 'Score ' + score + '  ·  Best ' + best;
-    $('ovBtn').textContent = kind === 'win' ? 'Next level' : 'Play again';
-    $('ovBtn').dataset.kind = kind;
+    $('ovText').textContent = 'Score ' + score + '  ·  Best ' + (prog.best[level] || 0);
+    const main = $('ovBtn');
+    main.hidden = false;
+    main.textContent = kind === 'win' ? 'Next level' : 'Retry';
+    main.dataset.kind = kind;
     overlay.hidden = false;
-    $('ovBtn').focus();
+    main.focus();
   }
 
   function fire() {
@@ -537,7 +608,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     else if (e.key === ' ' && document.activeElement === document.body) { e.preventDefault(); fire(); }
   });
 
-  $('restart').addEventListener('click', newGame);
+  $('restart').addEventListener('click', openPicker);
   function paintMute() {
     const m = $('mute');
     m.textContent = 'Sound: ' + (muted ? 'off' : 'on');
@@ -551,13 +622,17 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   });
   paintMute();
   $('ovBtn').addEventListener('click', () => {
-    if ($('ovBtn').dataset.kind === 'win') { level++; startLevel(); } else newGame();
+    startLevel($('ovBtn').dataset.kind === 'win' ? level + 1 : level);
   });
+  $('ovBtn2').addEventListener('click', openPicker);
+  $('cont').addEventListener('click', () => startLevel(prog.cleared + 1));
 
   new ResizeObserver(fit).observe(stage);
   window.addEventListener('resize', fit);
   fit();
-  newGame();
+  cur = null; nxt = null;
+  hud();
+  openPicker();
 
   let last = performance.now();
   function loop(now) {
