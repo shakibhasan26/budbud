@@ -207,7 +207,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
 
   let grid = [], flip = 0, level = 1, score = 0, misses = 0, nCols = 4, dropAt = 5;
   let prog = { cleared: 0, best: {} };
-  let cur = 0, nxt = 0, b = null, fx = [], state = 'aim', aim = Math.PI / 2, down = false;
+  let cur = 0, nxt = 0, b = null, fx = [], bumps = [], state = 'aim', aim = Math.PI / 2, down = false;
 
   // Progress (highest cleared level and best score per level) is kept on this phone.
   try {
@@ -291,7 +291,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     for (let r = 0; r < rows; r++) {
       grid.push(Array.from({ length: rowLen(r) }, () => Math.random() * nCols | 0));
     }
-    misses = 0; fx = []; b = null;
+    misses = 0; fx = []; bumps = []; b = null;
     cur = pick(); nxt = pick();
     state = 'aim';
     overlay.hidden = true;
@@ -352,15 +352,16 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     return false;
   }
 
-  function snap() {
-    const r0 = Math.max(0, Math.round((b.y - R) / RH));
+  function snap(px, py) {
+    if (px == null) { px = b.x; py = b.y; }
+    const r0 = Math.max(0, Math.round((py - R) / RH));
     while (grid.length <= r0 + 1) grid.push(emptyRow(rowLen(grid.length)));
     let bestC = null, bd = 1e9, bestAny = null, bad = 1e9;
     for (let r = Math.max(0, r0 - 1); r <= r0 + 1; r++) {
       for (let c = 0; c < rowLen(r); c++) {
         if (grid[r][c] != null) continue;
         const [x, y] = cellPos(r, c);
-        const d = (x - b.x) ** 2 + (y - b.y) ** 2;
+        const d = (x - px) ** 2 + (y - py) ** 2;
         if (d < bad) { bad = d; bestAny = [r, c]; }
         if ((r === 0 || nbrs(r, c).some(([a, e]) => grid[a][e] != null)) && d < bd) { bd = d; bestC = [r, c]; }
       }
@@ -405,6 +406,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   function land() {
     const [r, c] = snap();
     const col = b.col;
+    let rowAdded = false;
     grid[r][c] = col; b = null;
     const cl = cluster(r, c);
     if (cl.length >= 3) {
@@ -429,9 +431,20 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
       }
     } else {
       misses++; sfx.stick();
-      if (misses >= dropAt) { misses = 0; addRow(); sfx.drop(); }
+      if (misses >= dropAt) { misses = 0; addRow(); sfx.drop(); rowAdded = true; }
     }
     trim();
+    // the 5-6 bubbles touching the impact spot hop a little, away from it
+    bumps = [];
+    const lr = rowAdded ? r + 1 : r;
+    if (lr < grid.length) {
+      const [ix, iy] = cellPos(lr, c);
+      for (const [rr, cc] of nbrs(lr, c)) {
+        if (grid[rr][cc] == null) continue;
+        const [x, y] = cellPos(rr, cc), d = Math.hypot(x - ix, y - iy) || 1;
+        bumps.push({ r: rr, c: cc, t: 0, dx: (x - ix) / d, dy: (y - iy) / d });
+      }
+    }
     if (score > (prog.best[level] || 0)) { prog.best[level] = score; saveProg(); }
     if (isEmpty()) { state = 'win'; if (level > prog.cleared) prog.cleared = level; saveProg(); show('win'); sfx.win(); }
     else if (overLimit()) { state = 'over'; show('over'); sfx.over(); }
@@ -467,6 +480,8 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
   }
 
   function updateFx(dt) {
+    for (const m of bumps) m.t += dt / 0.4;
+    bumps = bumps.filter(m => m.t < 1);
     for (const f of fx) {
       if (f.k === 'pop') f.t += dt / 0.25;
       else { f.vy += 1400 * dt; f.x += f.vx * dt; f.y += f.vy * dt; }
@@ -522,7 +537,22 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     ctx.restore();
   }
 
-  function draw() {
+  // Where the current shot will end up: the bubble it hits and the empty cell it will snap into.
+  function aimTarget() {
+    let x = SX, y = SY, vx = Math.cos(aim), vy = -Math.sin(aim), hit = false;
+    for (let i = 0; i < 600; i++) {
+      x += vx * 4; y += vy * 4;
+      if (x < R) { x = R; vx = -vx; } else if (x > W - R) { x = W - R; vx = -vx; }
+      if (y <= R || collide(x, y)) { hit = true; break; }
+    }
+    if (!hit) return null;
+    const s = snap(x, y);
+    trim();
+    if (!s) return null;
+    return { land: cellPos(s[0], s[1]) };
+  }
+
+  function draw(now) {
     ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
     ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = PANEL; ctx.fillRect(0, DANGER, W, H - DANGER);
@@ -531,13 +561,31 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     ctx.beginPath(); ctx.moveTo(0, DANGER); ctx.lineTo(W, DANGER); ctx.stroke();
     ctx.setLineDash([]); ctx.globalAlpha = 1;
 
+    const tgt = state === 'aim' ? aimTarget() : null;
+    const t = (now || 0) / 1000;
     for (let r = 0; r < grid.length; r++) {
       for (let c = 0; c < grid[r].length; c++) {
         const v = grid[r][c];
         if (v == null) continue;
-        const [x, y] = cellPos(r, c);
-        bubble(x, y, v);
+        let [x, y] = cellPos(r, c), k = R;
+        // one-time jump for the bubbles around the spot the shot just hit
+        const bm = bumps.find(m => m.r === r && m.c === c);
+        if (bm) {
+          const s = Math.sin(Math.PI * Math.min(1, bm.t));
+          x += bm.dx * s * 3; y += bm.dy * s * 3 - s * 5; k = R * (1 + s * .08);
+        }
+        bubble(x, y, v, k);
       }
+    }
+    if (tgt) {
+      // white ring in front of the target bubble: this is where the shot will stick
+      ctx.save();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+      ctx.globalAlpha = .85 + .15 * Math.sin(t * 6);
+      ctx.beginPath(); ctx.arc(tgt.land[0], tgt.land[1], R - 1, 0, 7);
+      ctx.fillStyle = 'rgba(255,255,255,.22)'; ctx.fill();
+      ctx.stroke();
+      ctx.restore();
     }
     for (const f of fx) {
       if (f.k === 'pop') {
@@ -639,7 +687,7 @@ button:focus-visible { outline: 3px solid var(--text); outline-offset: 2px; }
     const dt = Math.min(.033, (now - last) / 1000); last = now;
     if (state === 'fly' && b) stepFlight(dt);
     updateFx(dt);
-    draw();
+    draw(now);
     requestAnimationFrame(loop);
   }
   requestAnimationFrame(loop);
